@@ -8,7 +8,7 @@ enum AutoOCRRuntime {
 final class AutoOCRAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Task { @MainActor in
-            AutoOCRRuntime.manager?.applyActivationPolicy()
+            AutoOCRRuntime.manager?.finishLaunching()
         }
     }
 
@@ -76,8 +76,8 @@ struct autoOCRApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra(isInserted: $ocrManager.showMenuBarIcon) {
-            ContentView(ocrManager: ocrManager)
+        MenuBarExtra(isInserted: ocrManager.menuBarIconBinding) {
+            ContentView(ocrManager: ocrManager, chrome: .menuExtra)
         } label: {
             Image(systemName: ocrManager.isCapturing ? "record.circle" : "text.viewfinder")
         }

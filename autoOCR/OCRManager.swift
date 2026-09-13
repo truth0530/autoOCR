@@ -109,6 +109,7 @@ final class OCRManager: ObservableObject {
     /// 메뉴바 아이콘. 붐비면 끄고 Dock/단축키만 쓰면 된다.
     @Published var showMenuBarIcon: Bool = true {
         didSet {
+            guard oldValue != showMenuBarIcon else { return }
             if settingsLoaded,
                !AccessPolicy.canTurnOff(dock: showDockIcon,
                                         menuBar: showMenuBarIcon,
@@ -120,6 +121,17 @@ final class OCRManager: ObservableObject {
             accessWarning = nil
             persist()
         }
+    }
+
+    /// MenuBarExtra(isInserted:)가 같은 값을 반복 대입하면 @Published가 무한 갱신된다.
+    var menuBarIconBinding: Binding<Bool> {
+        Binding(
+            get: { self.showMenuBarIcon },
+            set: { newValue in
+                guard newValue != self.showMenuBarIcon else { return }
+                self.showMenuBarIcon = newValue
+            }
+        )
     }
 
     // 캡션 미러(화면 오버레이). 기본 위치는 우측 상단.
@@ -285,6 +297,12 @@ final class OCRManager: ObservableObject {
         NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
     }
 
+    /// 앱 기동 완료 후 한 번 더 등록한다. init 시점의 Carbon 타깃이 비어 핫키가 빠지는 경우를 막는다.
+    func finishLaunching() {
+        registerShortcuts()
+        applyActivationPolicy()
+    }
+
     func togglePanel() {
         ControlPanelController.shared.toggle(manager: self)
     }
@@ -416,7 +434,9 @@ final class OCRManager: ObservableObject {
         let content: SCShareableContent
         do {
             content = try await Timed.run(seconds: 8) {
-                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                try await Task.detached {
+                    try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                }.value
             }
         } catch is Timed.Failure {
             statusMessage = "화면 캡처 응답이 없습니다. 화면 기록 권한을 확인한 뒤 다시 시도해주세요."

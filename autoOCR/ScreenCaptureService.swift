@@ -72,7 +72,9 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
 
         do {
             try await Timed.run(seconds: 8) {
-                try await stream.startCapture()
+                try await Task.detached {
+                    try await stream.startCapture()
+                }.value
             }
         } catch {
             setContinuation(nil)

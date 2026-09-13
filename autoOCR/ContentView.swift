@@ -1,24 +1,64 @@
 import SwiftUI
 import AppKit
 
-// 메뉴바에서 열리는 컴팩트 패널. 상태·로직은 OCRManager가 담당하고 여기서는 UI만 조립한다.
+/// 메뉴바 Extra는 내용 높이로 창을 잡는다. ScrollView+maxHeight를 넣으면
+/// 창 크기↔레이아웃이 서로 밀면서 메인 스레드가 100%가 된다.
+enum ControlChrome {
+    case menuExtra
+    case panel
+}
+
+// 상태·로직은 OCRManager가 담당하고 여기서는 UI만 조립한다.
 struct ContentView: View {
     @ObservedObject var ocrManager: OCRManager
+    var chrome: ControlChrome = .menuExtra
+
+    private static let panelHeight: CGFloat = 580
 
     var body: some View {
+        switch chrome {
+        case .menuExtra:
+            compactBody
+        case .panel:
+            panelBody
+        }
+    }
+
+    /// 메뉴바용. 고유 높이만 갖고 ScrollView를 쓰지 않는다.
+    private var compactBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            statusLine
+            Divider()
+            actionRow
+            resultCard(height: 96)
+            Button {
+                ocrManager.showPanel()
+            } label: {
+                Label("설정 열기", systemImage: "gearshape")
+                    .frame(maxWidth: .infinity, minHeight: 28)
+            }
+            .buttonStyle(.bordered)
+            Text("메뉴바가 붐비면 Dock 또는 ⌘⇧, 로도 설정을 엽니다.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Divider()
+            footer
+        }
+        .padding(14)
+        .frame(width: 360)
+    }
+
+    /// 독립 패널용. 스크롤 영역 높이를 고정해 레이아웃 루프를 막는다.
+    private var panelBody: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     header
-                    if !ocrManager.statusMessage.isEmpty {
-                        Text(ocrManager.statusMessage)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                    statusLine
                     Divider()
                     actionRow
-                    resultCard
+                    resultCard(height: 160)
                     settingsSection
                 }
                 .padding(14)
@@ -27,13 +67,17 @@ struct ContentView: View {
             footer
                 .padding(14)
         }
-        .frame(width: 360)
-        .frame(maxHeight: panelMaxHeight)
+        .frame(width: 360, height: Self.panelHeight)
     }
 
-    private var panelMaxHeight: CGFloat {
-        let visible = NSScreen.main?.visibleFrame.height ?? 800
-        return min(720, max(420, visible - 80))
+    @ViewBuilder
+    private var statusLine: some View {
+        if !ocrManager.statusMessage.isEmpty {
+            Text(ocrManager.statusMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     // MARK: - 헤더 + 상태
@@ -79,7 +123,7 @@ struct ContentView: View {
 
     // MARK: - 인식 결과
 
-    private var resultCard: some View {
+    private func resultCard(height: CGFloat) -> some View {
         ScrollView {
             Text(ocrManager.extractedText.isEmpty
                  ? "영역을 선택하면 인식된 텍스트가 여기에 표시됩니다."
@@ -90,7 +134,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
         }
-        .frame(height: 220)
+        .frame(height: height)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         .overlay(alignment: .bottomTrailing) {
             if !ocrManager.extractedText.isEmpty {

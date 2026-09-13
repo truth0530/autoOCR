@@ -29,10 +29,8 @@ final class ControlPanelController: NSObject, NSWindowDelegate {
     }
 
     private func makeWindow(manager: OCRManager) -> NSWindow {
-        let visibleHeight = NSScreen.main?.visibleFrame.height ?? 800
-        let height = min(640, max(420, visibleHeight - 80))
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 378, height: height),
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 580),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -41,7 +39,8 @@ final class ControlPanelController: NSObject, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 360, height: 360)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .moveToActiveSpace]
-        window.contentView = NSHostingView(rootView: ContentView(ocrManager: manager))
+        window.contentView = NSHostingView(rootView: ContentView(ocrManager: manager, chrome: .panel))
+        window.setContentSize(NSSize(width: 360, height: 580))
         window.setFrameAutosaveName("autoOCR.controlPanel")
         window.delegate = self
         if !window.setFrameUsingName("autoOCR.controlPanel") {
