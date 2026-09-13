@@ -22,6 +22,13 @@ struct KeyboardShortcutConfig: Codable, Equatable {
         keyLabel: "9"
     )
 
+    /// 기본 패널 열기 단축키: ⌘⇧,  (메뉴바 아이콘이 가려져도 설정·시작/중지에 들어가기 위함)
+    static let defaultPanel = KeyboardShortcutConfig(
+        keyCode: 43,
+        modifierFlags: NSEvent.ModifierFlags([.command, .shift]).rawValue,
+        keyLabel: ","
+    )
+
     private var flags: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: modifierFlags) }
 
     /// 표시용 라벨을 제외한 실제 키 조합이 같은지.

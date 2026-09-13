@@ -64,10 +64,65 @@ final class OCRManager: ObservableObject {
     @Published var captureShortcut: KeyboardShortcutConfig? = .defaultCaptureNow {
         didSet { persist(); registerShortcuts() }
     }
+    // 패널 열기 단축키. 기본 ⌘⇧,  — 메뉴바 아이콘이 가려져도 설정에 들어간다.
+    @Published var panelShortcut: KeyboardShortcutConfig? = .defaultPanel {
+        didSet {
+            if settingsLoaded,
+               !AccessPolicy.canTurnOff(dock: showDockIcon,
+                                        menuBar: showMenuBarIcon,
+                                        hasPanelShortcut: panelShortcut != nil) {
+                panelShortcut = oldValue
+                accessWarning = "메뉴바와 Dock이 꺼져 있으면 패널 단축키를 해제할 수 없습니다."
+                return
+            }
+            accessWarning = nil
+            persist()
+            registerShortcuts()
+        }
+    }
+    /// 단축키 역할. 충돌 검사에 사용한다.
+    enum ShortcutRole {
+        case region
+        case captureNow
+        case panel
+    }
     // 단축키 충돌 등 경고 메시지 (없으면 nil)
     @Published private(set) var shortcutWarning: String?
+    @Published private(set) var accessWarning: String?
 
-    // 캡션 미러(화면 하단 자막형 오버레이)
+    /// 노치·엣지 등으로 메뉴바가 꽉 차도 Dock에서 앱을 고르고 끌 수 있게. 기본 켬.
+    @Published var showDockIcon: Bool = true {
+        didSet {
+            if settingsLoaded,
+               !AccessPolicy.canTurnOff(dock: showDockIcon,
+                                        menuBar: showMenuBarIcon,
+                                        hasPanelShortcut: panelShortcut != nil) {
+                showDockIcon = oldValue
+                accessWarning = "메뉴바·Dock을 동시에 끄려면 패널 열기 단축키를 먼저 지정하세요."
+                return
+            }
+            accessWarning = nil
+            persist()
+            applyActivationPolicy()
+        }
+    }
+    /// 메뉴바 아이콘. 붐비면 끄고 Dock/단축키만 쓰면 된다.
+    @Published var showMenuBarIcon: Bool = true {
+        didSet {
+            if settingsLoaded,
+               !AccessPolicy.canTurnOff(dock: showDockIcon,
+                                        menuBar: showMenuBarIcon,
+                                        hasPanelShortcut: panelShortcut != nil) {
+                showMenuBarIcon = oldValue
+                accessWarning = "메뉴바·Dock을 동시에 끄려면 패널 열기 단축키를 먼저 지정하세요."
+                return
+            }
+            accessWarning = nil
+            persist()
+        }
+    }
+
+    // 캡션 미러(화면 오버레이). 기본 위치는 우측 상단.
     @Published var captionOverlayEnabled: Bool = true {
         didSet {
             persist()
@@ -79,6 +134,18 @@ final class OCRManager: ObservableObject {
         didSet {
             persist()
             if captionOverlayEnabled { captionMirror.setPinned(captionPinned) }
+        }
+    }
+    @Published var captionPosition: CaptionPosition = CaptionLayout.defaultPosition {
+        didSet {
+            persist()
+            captionMirror.apply(position: captionPosition, fontSize: CGFloat(captionFontSize))
+        }
+    }
+    @Published var captionFontSize: Double = Double(CaptionLayout.defaultFontSize) {
+        didSet {
+            persist()
+            captionMirror.apply(position: captionPosition, fontSize: CGFloat(captionFontSize))
         }
     }
 
@@ -110,6 +177,11 @@ final class OCRManager: ObservableObject {
     private var selectedDisplayID: CGDirectDisplayID?
     private var pixelScale: CGFloat = 2
     private var recognitionTask: Task<Void, Never>?
+    /// 사용자가 인식을 켜 둔 상태. 스트림이 죽어도 true면 재연결한다.
+    private var shouldCapture = false
+    private var isRecovering = false
+    private var recoverCount = 0
+    private var lifecycleObservers: [NSObjectProtocol] = []
 
     // 전환(페이드) 프레임 방지용 정착 설정.
     // 화면이 settleDelay 동안 안 바뀌면 인식하되, 계속 바뀌어도(영상 등) 상한 시간이 지나면
@@ -160,11 +232,29 @@ final class OCRManager: ObservableObject {
         if let data = defaults.data(forKey: Keys.captureShortcut) {
             captureShortcut = try? JSONDecoder().decode(KeyboardShortcutConfig.self, from: data)
         }
+        if let data = defaults.data(forKey: Keys.panelShortcut) {
+            panelShortcut = try? JSONDecoder().decode(KeyboardShortcutConfig.self, from: data)
+        }
+        if defaults.object(forKey: Keys.showDockIcon) != nil {
+            showDockIcon = defaults.bool(forKey: Keys.showDockIcon)
+        }
+        if defaults.object(forKey: Keys.showMenuBarIcon) != nil {
+            showMenuBarIcon = defaults.bool(forKey: Keys.showMenuBarIcon)
+        }
         if defaults.object(forKey: Keys.captionEnabled) != nil {
             captionOverlayEnabled = defaults.bool(forKey: Keys.captionEnabled)
         }
         if defaults.object(forKey: Keys.captionPinned) != nil {
             captionPinned = defaults.bool(forKey: Keys.captionPinned)
+        }
+        if let raw = defaults.string(forKey: Keys.captionPosition),
+           let pos = CaptionPosition(rawValue: raw) {
+            captionPosition = pos
+        }
+        if defaults.object(forKey: Keys.captionFontSize) != nil {
+            let size = defaults.double(forKey: Keys.captionFontSize)
+            captionFontSize = min(max(size, CaptionLayout.fontSizeRange.lowerBound),
+                                  CaptionLayout.fontSizeRange.upperBound)
         }
         if defaults.object(forKey: Keys.languageCorrection) != nil {
             languageCorrection = defaults.bool(forKey: Keys.languageCorrection)
@@ -183,32 +273,67 @@ final class OCRManager: ObservableObject {
         }
         settingsLoaded = true
 
+        AutoOCRRuntime.manager = self
         registerShortcuts()
+        captionMirror.apply(position: captionPosition, fontSize: CGFloat(captionFontSize))
         if captionOverlayEnabled { captionMirror.setPinned(captionPinned) }
+        installLifecycleObservers()
+        applyActivationPolicy()
+    }
+
+    func applyActivationPolicy() {
+        NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
+    }
+
+    func togglePanel() {
+        ControlPanelController.shared.toggle(manager: self)
+    }
+
+    func showPanel() {
+        ControlPanelController.shared.show(manager: self)
+    }
+
+    deinit {
+        for observer in lifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
     }
 
     /// 새로 지정하려는 단축키가 유효한지 검사한다. 문제가 있으면 안내 메시지를 반환(있으면 저장 차단).
-    /// - Parameter forCaptureNow: true면 '지금 캡처' 슬롯, false면 '영역 선택' 슬롯.
-    func validateShortcut(_ config: KeyboardShortcutConfig, forCaptureNow: Bool) -> String? {
-        // 같은 슬롯에 동일 조합을 다시 지정하는 건 변화 없음 → 허용.
-        let current = forCaptureNow ? captureShortcut : globalShortcut
+    func validateShortcut(_ config: KeyboardShortcutConfig, role: ShortcutRole) -> String? {
+        let current: KeyboardShortcutConfig? = {
+            switch role {
+            case .region:     return globalShortcut
+            case .captureNow: return captureShortcut
+            case .panel:      return panelShortcut
+            }
+        }()
         if let current, config.sameCombo(as: current) { return nil }
 
-        // 다른 슬롯의 단축키와 충돌.
-        let other = forCaptureNow ? globalShortcut : captureShortcut
-        if let other, config.sameCombo(as: other) {
-            let otherName = forCaptureNow ? "영역 선택" : "지금 캡처"
-            return "‘\(otherName)’ 단축키와 같습니다. 다른 키를 선택하세요."
+        let others: [(String, KeyboardShortcutConfig?)] = {
+            switch role {
+            case .region:
+                return [("지금 캡처", captureShortcut), ("패널 열기", panelShortcut)]
+            case .captureNow:
+                return [("영역 선택", globalShortcut), ("패널 열기", panelShortcut)]
+            case .panel:
+                return [("영역 선택", globalShortcut), ("지금 캡처", captureShortcut)]
+            }
+        }()
+        for (name, other) in others {
+            if let other, config.sameCombo(as: other) {
+                return "‘\(name)’ 단축키와 같습니다. 다른 키를 선택하세요."
+            }
         }
 
-        // 시스템/다른 앱이 이미 쓰는 조합.
         if !hotKeyManager.canRegister(config) {
             return "이미 다른 곳에서 사용 중인 단축키입니다. 다른 키를 선택하세요."
         }
         return nil
     }
 
-    /// 두 전역 단축키(영역 선택 / 지금 캡처)를 등록하고 충돌을 검사한다.
+    /// 전역 단축키를 등록하고 충돌을 검사한다.
     private func registerShortcuts() {
         let okRegion = hotKeyManager.register(id: 1, config: globalShortcut) { [weak self] in
             Task { @MainActor in await self?.selectRegion() }
@@ -216,17 +341,33 @@ final class OCRManager: ObservableObject {
         let okCapture = hotKeyManager.register(id: 2, config: captureShortcut) { [weak self] in
             Task { @MainActor in await self?.captureNow() }
         }
+        let okPanel = hotKeyManager.register(id: 3, config: panelShortcut) { [weak self] in
+            Task { @MainActor in self?.togglePanel() }
+        }
 
         var warnings: [String] = []
-        if let region = globalShortcut, let capture = captureShortcut, region.sameCombo(as: capture) {
-            // 두 단축키가 같으면 하나만 등록되므로 명확히 안내한다.
-            warnings.append("‘영역 선택’과 ‘지금 캡처’ 단축키가 \(region.displayString) 로 같습니다. 하나를 바꿔주세요.")
-        } else {
+        let slots: [(String, KeyboardShortcutConfig?)] = [
+            ("영역 선택", globalShortcut),
+            ("지금 캡처", captureShortcut),
+            ("패널 열기", panelShortcut)
+        ]
+        outer: for i in 0..<slots.count {
+            for j in (i + 1)..<slots.count {
+                if let a = slots[i].1, let b = slots[j].1, a.sameCombo(as: b) {
+                    warnings.append("‘\(slots[i].0)’과 ‘\(slots[j].0)’ 단축키가 \(a.displayString) 로 같습니다. 하나를 바꿔주세요.")
+                    break outer
+                }
+            }
+        }
+        if warnings.isEmpty {
             if globalShortcut != nil, !okRegion {
                 warnings.append("‘영역 선택’ 단축키(\(globalShortcut!.displayString))가 다른 앱/시스템과 충돌합니다. 다른 조합을 사용해주세요.")
             }
             if captureShortcut != nil, !okCapture {
                 warnings.append("‘지금 캡처’ 단축키(\(captureShortcut!.displayString))가 다른 앱/시스템과 충돌합니다. 다른 조합을 사용해주세요.")
+            }
+            if panelShortcut != nil, !okPanel {
+                warnings.append("‘패널 열기’ 단축키(\(panelShortcut!.displayString))가 다른 앱/시스템과 충돌합니다. 다른 조합을 사용해주세요.")
             }
         }
         shortcutWarning = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
@@ -235,6 +376,7 @@ final class OCRManager: ObservableObject {
     // MARK: - 영역 선택 (선택 후 자동으로 인식 시작)
 
     func selectRegion() async {
+        ControlPanelController.shared.hide()
         if isCapturing { await stopCapturing(silent: true) }
 
         guard let result = await selectionController.selectRegion() else {
@@ -266,12 +408,20 @@ final class OCRManager: ObservableObject {
             statusMessage = "먼저 영역을 선택해주세요."
             return
         }
+        shouldCapture = true
+        if !isRecovering { recoverCount = 0 }
 
         // 실제 권한 판정: ScreenCaptureKit 콘텐츠 조회가 성공하면 권한이 있는 것이다.
         // (CGPreflightScreenCaptureAccess는 부여 직후/개발 서명에서 신뢰하기 어렵다.)
         let content: SCShareableContent
         do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            content = try await Timed.run(seconds: 8) {
+                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            }
+        } catch is Timed.Failure {
+            statusMessage = "화면 캡처 응답이 없습니다. 화면 기록 권한을 확인한 뒤 다시 시도해주세요."
+            isCapturing = false
+            return
         } catch {
             await guidePermission()
             return
@@ -289,18 +439,24 @@ final class OCRManager: ObservableObject {
             isCapturing = true
             statusMessage = "실시간 인식 중…"
             recognitionTask = Task { await consume(frames) }
+        } catch is Timed.Failure {
+            statusMessage = "캡처 시작이 시간 초과되었습니다. 다시 시작해주세요."
+            await captureService.stop()
+            isCapturing = false
         } catch {
             statusMessage = "캡처 시작 실패: \(error.localizedDescription)"
             await captureService.stop()
+            isCapturing = false
         }
     }
 
     func stopCapturing(silent: Bool = false) async {
+        shouldCapture = false
+        isCapturing = false
         recognitionTask?.cancel()
         recognitionTask = nil
         latestBuffer = nil
         await captureService.stop()
-        isCapturing = false
         isProcessing = false
         if !silent { statusMessage = "인식을 중지했습니다." }
     }
@@ -344,6 +500,7 @@ final class OCRManager: ObservableObject {
         for await pixelBuffer in frames {
             if Task.isCancelled { break }
 
+            recoverCount = 0
             latestBuffer = pixelBuffer   // '지금 캡처'용 최신 프레임 보관
 
             let now = Date()
@@ -385,6 +542,64 @@ final class OCRManager: ObservableObject {
             isProcessing = false
         }
         isProcessing = false
+        // 사용자가 끈 게 아닌데 스트림이 끝나면(절전·화면 변경·권한 흔들림) 재연결한다.
+        if !Task.isCancelled, shouldCapture {
+            await recoverCapture(reason: "스트림 종료")
+        }
+    }
+
+    /// 죽은 캡처 세션을 몇 번까지 자동으로 다시 연다. 프레임이 다시 오면 recoverCount가 0으로 돌아간다.
+    private func recoverCapture(reason: String) async {
+        guard shouldCapture, !isRecovering else { return }
+        if recoverCount >= 5 {
+            shouldCapture = false
+            isCapturing = false
+            statusMessage = "캡처가 반복해서 끊겼습니다. 영역 선택을 다시 해주세요."
+            return
+        }
+        isRecovering = true
+        defer { isRecovering = false }
+
+        while shouldCapture && recoverCount < 5 {
+            recoverCount += 1
+            statusMessage = "캡처 재연결 중… (\(reason))"
+            recognitionTask?.cancel()
+            recognitionTask = nil
+            latestBuffer = nil
+            await captureService.stop()
+            isCapturing = false
+            isProcessing = false
+            let delay = min(0.4 * Double(recoverCount), 2.0)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard shouldCapture else { return }
+            await startCapturing()
+            if isCapturing { return }
+        }
+        if shouldCapture {
+            shouldCapture = false
+            isCapturing = false
+            statusMessage = "캡처가 반복해서 끊겼습니다. 영역 선택을 다시 해주세요."
+        }
+    }
+
+    private func recoverIfCapturing(reason: String) async {
+        guard shouldCapture else { return }
+        await recoverCapture(reason: reason)
+    }
+
+    private func installLifecycleObservers() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        let wake = workspace.addObserver(forName: NSWorkspace.didWakeNotification,
+                                         object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.recoverIfCapturing(reason: "깨어남") }
+        }
+        let screens = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.recoverIfCapturing(reason: "화면 변경") }
+        }
+        lifecycleObservers = [wake, screens]
     }
 
     /// 인식된 텍스트를 누적 모드/교체 모드에 맞춰 반영한다.
@@ -408,7 +623,7 @@ final class OCRManager: ObservableObject {
             extractedText = trimmed
         }
 
-        // 캡션 미러(하단 자막형 오버레이)에 방금 캡처한 텍스트를 표시한다.
+        // 캡션 미러에 방금 캡처한 텍스트를 표시한다.
         if captionOverlayEnabled {
             captionMirror.update(trimmed, pinned: captionPinned)
         }
@@ -503,9 +718,14 @@ final class OCRManager: ObservableObject {
         static let language = "recognitionLanguage"
         static let shortcut = "globalShortcut"
         static let captureShortcut = "captureShortcut"
+        static let panelShortcut = "panelShortcut"
         static let shortcutMigration = "shortcutDefaultsMigration"
+        static let showDockIcon = "showDockIcon"
+        static let showMenuBarIcon = "showMenuBarIcon"
         static let captionEnabled = "captionOverlayEnabled"
         static let captionPinned = "captionPinned"
+        static let captionPosition = "captionPosition"
+        static let captionFontSize = "captionFontSize"
         static let languageCorrection = "ocrLanguageCorrection"
         static let contrast = "ocrContrast"
         static let upscale = "ocrUpscale"
@@ -526,8 +746,14 @@ final class OCRManager: ObservableObject {
         defaults.set(globalShortcut == nil ? Data() : data, forKey: Keys.shortcut)
         let captureData = (try? JSONEncoder().encode(captureShortcut)) ?? Data()
         defaults.set(captureShortcut == nil ? Data() : captureData, forKey: Keys.captureShortcut)
+        let panelData = (try? JSONEncoder().encode(panelShortcut)) ?? Data()
+        defaults.set(panelShortcut == nil ? Data() : panelData, forKey: Keys.panelShortcut)
+        defaults.set(showDockIcon, forKey: Keys.showDockIcon)
+        defaults.set(showMenuBarIcon, forKey: Keys.showMenuBarIcon)
         defaults.set(captionOverlayEnabled, forKey: Keys.captionEnabled)
         defaults.set(captionPinned, forKey: Keys.captionPinned)
+        defaults.set(captionPosition.rawValue, forKey: Keys.captionPosition)
+        defaults.set(captionFontSize, forKey: Keys.captionFontSize)
         defaults.set(languageCorrection, forKey: Keys.languageCorrection)
         defaults.set(ocrContrast, forKey: Keys.contrast)
         defaults.set(upscaleSmallText, forKey: Keys.upscale)

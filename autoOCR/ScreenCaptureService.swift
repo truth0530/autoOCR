@@ -1,6 +1,25 @@
 import ScreenCaptureKit
 import CoreMedia
 import CoreVideo
+import Foundation
+import Darwin
+
+enum Timed {
+    enum Failure: Error { case timeout }
+
+    static func run<T>(seconds: TimeInterval, _ operation: @escaping () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw Failure.timeout
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+}
 
 /// `SCStream`을 감싸 캡처된 프레임을 픽셀 버퍼의 async 스트림으로 전달한다.
 ///
@@ -29,6 +48,9 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 지정한 영역(top-left screen points)을 캡처하기 시작한다.
     /// - Returns: 완성된 프레임마다 픽셀 버퍼를 방출하는 async 스트림.
     func start(region: CGRect, display: SCDisplay, pixelScale: CGFloat) async throws -> AsyncStream<CVPixelBuffer> {
+        // 이전 스트림이 남아 있으면 먼저 정리한다. (재시작 시 이중 캡처·멈춤 방지)
+        await stop()
+
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
 
         let config = SCStreamConfiguration()
@@ -48,7 +70,15 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
             setContinuation(continuation)
         }
 
-        try await stream.startCapture()
+        do {
+            try await Timed.run(seconds: 8) {
+                try await stream.startCapture()
+            }
+        } catch {
+            setContinuation(nil)
+            try? await Timed.run(seconds: 3) { try await stream.stopCapture() }
+            throw error
+        }
         self.stream = stream
         return frames
     }
@@ -57,9 +87,11 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
         withContinuation { $0.finish() }
         setContinuation(nil)
         if let stream {
-            try? await stream.stopCapture()
+            self.stream = nil
+            try? await Timed.run(seconds: 3) {
+                try await stream.stopCapture()
+            }
         }
-        stream = nil
     }
 
     // MARK: - SCStreamOutput
@@ -69,7 +101,16 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
               CMSampleBufferIsValid(sampleBuffer),
               Self.isComplete(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        withContinuation { $0.yield(pixelBuffer) }
+        // 샘플 콜백이 끝나면 원본 버퍼가 재사용될 수 있어 복사본을 OCR에 넘긴다.
+        let payload = Self.copyPixelBuffer(pixelBuffer) ?? pixelBuffer
+        withContinuation { $0.yield(payload) }
+    }
+
+    // MARK: - SCStreamDelegate
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        withContinuation { $0.finish() }
+        setContinuation(nil)
     }
 
     /// 프레임 상태가 `.complete`인지 확인한다. (빈/유휴 프레임 인식을 방지)
@@ -82,5 +123,61 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
             return true
         }
         return status == .complete
+    }
+
+    private static func copyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let format = CVPixelBufferGetPixelFormatType(source)
+        var copy: CVPixelBuffer?
+        let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary]
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
+                                  attrs as CFDictionary, &copy) == kCVReturnSuccess,
+              let copy else { return nil }
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(copy, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(copy, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+
+        let planes = CVPixelBufferGetPlaneCount(source)
+        if planes == 0 {
+            copyPlane(from: source, to: copy, plane: nil)
+        } else {
+            for plane in 0..<planes {
+                copyPlane(from: source, to: copy, plane: plane)
+            }
+        }
+        return copy
+    }
+
+    private static func copyPlane(from source: CVPixelBuffer, to dest: CVPixelBuffer, plane: Int?) {
+        let height: Int
+        let srcBPR: Int
+        let dstBPR: Int
+        let srcBase: UnsafeMutableRawPointer?
+        let dstBase: UnsafeMutableRawPointer?
+        if let plane {
+            height = CVPixelBufferGetHeightOfPlane(source, plane)
+            srcBPR = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+            dstBPR = CVPixelBufferGetBytesPerRowOfPlane(dest, plane)
+            srcBase = CVPixelBufferGetBaseAddressOfPlane(source, plane)
+            dstBase = CVPixelBufferGetBaseAddressOfPlane(dest, plane)
+        } else {
+            height = CVPixelBufferGetHeight(source)
+            srcBPR = CVPixelBufferGetBytesPerRow(source)
+            dstBPR = CVPixelBufferGetBytesPerRow(dest)
+            srcBase = CVPixelBufferGetBaseAddress(source)
+            dstBase = CVPixelBufferGetBaseAddress(dest)
+        }
+        guard let srcBase, let dstBase, height > 0, srcBPR > 0, dstBPR > 0 else { return }
+        let rowBytes = min(srcBPR, dstBPR)
+        for y in 0..<height {
+            memcpy(dstBase.advanced(by: y * dstBPR),
+                   srcBase.advanced(by: y * srcBPR),
+                   rowBytes)
+        }
     }
 }

@@ -1,21 +1,39 @@
 import SwiftUI
+import AppKit
 
 // 메뉴바에서 열리는 컴팩트 패널. 상태·로직은 OCRManager가 담당하고 여기서는 UI만 조립한다.
 struct ContentView: View {
     @ObservedObject var ocrManager: OCRManager
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
-            Divider()
-            actionRow
-            resultCard
-            settingsSection
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    header
+                    if !ocrManager.statusMessage.isEmpty {
+                        Text(ocrManager.statusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Divider()
+                    actionRow
+                    resultCard
+                    settingsSection
+                }
+                .padding(14)
+            }
             Divider()
             footer
+                .padding(14)
         }
-        .padding(14)
         .frame(width: 360)
+        .frame(maxHeight: panelMaxHeight)
+    }
+
+    private var panelMaxHeight: CGFloat {
+        let visible = NSScreen.main?.visibleFrame.height ?? 800
+        return min(720, max(420, visible - 80))
     }
 
     // MARK: - 헤더 + 상태
@@ -137,21 +155,30 @@ struct ContentView: View {
                 .fixedSize()
             }
 
+            accessSection
+
             HStack(alignment: .top) {
                 Text("영역 선택 단축키")
                     .font(.subheadline)
                 Spacer()
                 ShortcutRecorder(shortcut: $ocrManager.globalShortcut,
-                                 validate: { ocrManager.validateShortcut($0, forCaptureNow: false) })
+                                 validate: { ocrManager.validateShortcut($0, role: .region) })
             }
             HStack(alignment: .top) {
                 Text("지금 캡처 단축키")
                     .font(.subheadline)
                 Spacer()
                 ShortcutRecorder(shortcut: $ocrManager.captureShortcut,
-                                 validate: { ocrManager.validateShortcut($0, forCaptureNow: true) })
+                                 validate: { ocrManager.validateShortcut($0, role: .captureNow) })
             }
-            Text("‘지금 캡처’는 간격을 무시하고 현재 화면을 즉시 한 번 캡처합니다.")
+            HStack(alignment: .top) {
+                Text("패널 열기 단축키")
+                    .font(.subheadline)
+                Spacer()
+                ShortcutRecorder(shortcut: $ocrManager.panelShortcut,
+                                 validate: { ocrManager.validateShortcut($0, role: .panel) })
+            }
+            Text("‘지금 캡처’는 간격을 무시하고 현재 화면을 즉시 한 번 캡처합니다. 메뉴바 아이콘이 가려지면 패널 단축키나 Dock으로 설정에 들어갑니다.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
@@ -169,7 +196,7 @@ struct ContentView: View {
             Divider().padding(.vertical, 2)
 
             Toggle(isOn: $ocrManager.captionOverlayEnabled) {
-                Text("화면에 캡션 표시 (하단 자막)")
+                Text("화면에 캡션 표시")
                     .font(.subheadline)
             }
             .toggleStyle(.switch)
@@ -182,6 +209,34 @@ struct ContentView: View {
             .toggleStyle(.switch)
             .controlSize(.small)
             .disabled(!ocrManager.captionOverlayEnabled)
+
+            HStack {
+                Text("캡션 위치")
+                    .font(.subheadline)
+                Spacer()
+                Picker("", selection: $ocrManager.captionPosition) {
+                    ForEach(CaptionPosition.allCases) { pos in
+                        Text(pos.title).tag(pos)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+                .disabled(!ocrManager.captionOverlayEnabled)
+            }
+
+            HStack {
+                Text("캡션 글자 크기")
+                    .font(.subheadline)
+                Spacer()
+                Text("\(Int(ocrManager.captionFontSize.rounded()))pt")
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: $ocrManager.captionFontSize,
+                   in: CaptionLayout.fontSizeRange,
+                   step: 1)
+                .disabled(!ocrManager.captionOverlayEnabled)
 
             Divider().padding(.vertical, 2)
 
@@ -210,6 +265,46 @@ struct ContentView: View {
             Divider().padding(.vertical, 2)
 
             ocrQualitySection
+        }
+    }
+
+    // MARK: - 앱 접근 (노치·메뉴바 혼잡 대비)
+
+    private var accessSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("앱 접근")
+                .font(.subheadline.weight(.semibold))
+            Text("이 맥은 노치와 엣지 등 메뉴바 아이콘이 많으면 autoOCR을 누르지 못할 수 있습니다. Dock이나 패널 단축키(기본 ⌘⇧,)로 열고, 붐비면 메뉴바 아이콘을 끄세요.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Toggle(isOn: $ocrManager.showDockIcon) {
+                Text("Dock에 아이콘 표시")
+                    .font(.subheadline)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            Toggle(isOn: $ocrManager.showMenuBarIcon) {
+                Text("메뉴바에 아이콘 표시")
+                    .font(.subheadline)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            if let warning = ocrManager.accessWarning {
+                HStack(alignment: .top, spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(warning)
+                        .foregroundStyle(.orange)
+                }
+                .font(.caption2)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider().padding(.vertical, 2)
         }
     }
 

@@ -7,8 +7,10 @@ import AppKit
 final class ToastPresenter {
     private var panel: NSPanel?
     private var hideWorkItem: DispatchWorkItem?
+    private var generation = 0
 
     func show(_ message: String) {
+        generation += 1
         let panel = self.panel ?? makePanel()
         self.panel = panel
 
@@ -28,6 +30,9 @@ final class ToastPresenter {
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panel.animator().alphaValue = 1
             }
+        } else {
+            panel.alphaValue = 1
+            panel.orderFrontRegardless()
         }
 
         let work = DispatchWorkItem { [weak self] in self?.hide() }
@@ -37,11 +42,13 @@ final class ToastPresenter {
 
     private func hide() {
         guard let panel, panel.isVisible else { return }
+        let gen = generation
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.45
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             panel.animator().alphaValue = 0
-        }, completionHandler: { [weak panel] in
+        }, completionHandler: { [weak self, weak panel] in
+            guard let self, self.generation == gen else { return }
             panel?.orderOut(nil)
         })
     }
