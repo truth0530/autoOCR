@@ -67,7 +67,7 @@ final class ToastPresenter {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         // 전체화면(예: 유튜브 전체화면) 위에도 표시되도록.
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.collectionBehavior = WindowChrome.caption
         panel.contentView = NSHostingView(rootView: ToastView(message: ""))
         return panel
     }

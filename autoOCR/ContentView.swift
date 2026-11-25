@@ -31,7 +31,7 @@ struct ContentView: View {
             statusLine
             Divider()
             actionRow
-            resultCard(height: 96)
+            resultCard(minHeight: 96, maxHeight: 96)
             Button {
                 ocrManager.showPanel()
             } label: {
@@ -49,19 +49,24 @@ struct ContentView: View {
         .frame(width: 360)
     }
 
-    /// 독립 패널용. 스크롤 영역 높이를 고정해 레이아웃 루프를 막는다.
+    /// 독립 패널용. 스크롤 높이는 창에 고정한다. 내용이 창보다 짧으면 결과 카드가
+    /// 남는 높이를 받고, 세부 설정을 펼치면 그때만 스크롤된다.
     private var panelBody: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    header
-                    statusLine
-                    Divider()
-                    actionRow
-                    resultCard(height: 160)
-                    settingsSection
+            GeometryReader { geo in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        header
+                        statusLine
+                        Divider()
+                        actionRow
+                        resultCard(minHeight: 96, maxHeight: 200, expands: true)
+                        settingsSection
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .top)
                 }
-                .padding(14)
+                .scrollBounceBehavior(.basedOnSize)
             }
             Divider()
             footer
@@ -90,7 +95,8 @@ struct ContentView: View {
                 .font(.headline)
             Spacer()
             StatusBadge(isCapturing: ocrManager.isCapturing,
-                        isProcessing: ocrManager.isProcessing)
+                        isProcessing: ocrManager.isProcessing,
+                        interval: ocrManager.recognitionInterval)
         }
     }
 
@@ -105,7 +111,9 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, minHeight: 30)
             }
             .buttonStyle(.borderedProminent)
-            .help("영역을 선택하면 곧바로 실시간 인식이 시작됩니다.")
+            .help(RecognitionCopy.isAutomatic(ocrManager.recognitionInterval)
+                  ? "영역을 선택하면 곧바로 인식이 시작됩니다."
+                  : "영역을 선택하면 캡처가 대기합니다. 단축키로 한 번씩 읽습니다.")
 
             Button {
                 Task { await ocrManager.toggleCapturing() }
@@ -123,7 +131,8 @@ struct ContentView: View {
 
     // MARK: - 인식 결과
 
-    private func resultCard(height: CGFloat) -> some View {
+    /// min과 max가 같으면 높이가 고정된다. 패널에서는 남는 세로 공간을 결과 카드가 받는다.
+    private func resultCard(minHeight: CGFloat, maxHeight: CGFloat, expands: Bool = false) -> some View {
         ScrollView {
             Text(ocrManager.extractedText.isEmpty
                  ? "영역을 선택하면 인식된 텍스트가 여기에 표시됩니다."
@@ -134,7 +143,8 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
         }
-        .frame(height: height)
+        .frame(maxWidth: .infinity, minHeight: minHeight, maxHeight: maxHeight)
+        .layoutPriority(expands ? 1 : 0)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         .overlay(alignment: .bottomTrailing) {
             if !ocrManager.extractedText.isEmpty {
@@ -146,12 +156,21 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 설정 (인식 주기 / 자동 복사)
+    // MARK: - 설정
 
-    // 프리셋: 빠른 자막(0.5초) ~ 고정 슬라이드(30초)
-    private let intervalPresets: [Double] = [0.5, 10, 30]
+    // 0은 자동 인식 끔. 나머지는 빠른 자막(0.5초)부터 고정 슬라이드(30초).
+    private let intervalPresets: [Double] = [0, 0.5, 10, 30]
 
+    /// 매일 바꾸는 값만 펼쳐 둔다. 위치·단축키·접근·전처리는 각 묶음 안에 접어 둔다.
     private var settingsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            intervalBlock
+            behaviorBlock
+            detailBlock
+        }
+    }
+
+    private var intervalBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("인식 주기")
@@ -165,100 +184,103 @@ struct ContentView: View {
             // (짧은 주기 쪽에 해상도가 더 실려 미세 조절이 쉽다.)
             Slider(value: logIntervalBinding,
                    in: log(OCRManager.intervalRange.lowerBound)...log(OCRManager.intervalRange.upperBound))
+                .help("끄면 자동으로 읽지 않습니다. 슬라이더를 움직이면 주기 인식으로 돌아갑니다.")
+                .opacity(RecognitionCopy.isAutomatic(ocrManager.recognitionInterval) ? 1 : 0.4)
 
-            HStack {
-                Text("0.5초").font(.caption2).foregroundStyle(.secondary)
-                Spacer()
-                Text("60초").font(.caption2).foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 6) {
-                ForEach(intervalPresets, id: \.self) { preset in
-                    Button(Self.format(preset)) {
-                        ocrManager.recognitionInterval = preset
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .tint(isSelected(preset) ? .accentColor : .secondary)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) {
+                    presetButtons
+                    Spacer(minLength: 10)
+                    languageControl
                 }
-            }
-
-            Divider().padding(.vertical, 2)
-
-            HStack {
-                Text("인식 언어")
-                    .font(.subheadline)
-                Spacer()
-                Picker("", selection: $ocrManager.language) {
-                    ForEach(RecognitionLanguage.allCases) { lang in
-                        Text(lang.title).tag(lang)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) { presetButtons }
+                    HStack {
+                        Spacer(minLength: 0)
+                        languageControl
                     }
                 }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .fixedSize()
             }
+        }
+    }
 
-            accessSection
+    private var behaviorBlock: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 16) {
+                optionToggle("캡션",
+                             help: "인식한 텍스트를 화면 구석에 띄웁니다.",
+                             isOn: $ocrManager.captionOverlayEnabled)
+                optionToggle("자동 복사",
+                             help: "새로 인식한 텍스트를 클립보드에 넣습니다.",
+                             isOn: $ocrManager.autoCopy)
+            }
+            HStack(spacing: 16) {
+                optionToggle("누적",
+                             help: "새 자막을 지우지 않고 이어 붙입니다.",
+                             isOn: $ocrManager.accumulate)
+                optionToggle("중복 제거",
+                             help: "누적할 때 완전히 같은 문구는 한 번만 남깁니다.",
+                             isOn: $ocrManager.deduplicate,
+                             enabled: ocrManager.accumulate)
+            }
+        }
+    }
 
-            HStack(alignment: .top) {
-                Text("영역 선택 단축키")
-                    .font(.subheadline)
-                Spacer()
-                ShortcutRecorder(shortcut: $ocrManager.globalShortcut,
-                                 validate: { ocrManager.validateShortcut($0, role: .region) })
-            }
-            HStack(alignment: .top) {
-                Text("지금 캡처 단축키")
-                    .font(.subheadline)
-                Spacer()
-                ShortcutRecorder(shortcut: $ocrManager.captureShortcut,
-                                 validate: { ocrManager.validateShortcut($0, role: .captureNow) })
-            }
-            HStack(alignment: .top) {
-                Text("패널 열기 단축키")
-                    .font(.subheadline)
-                Spacer()
-                ShortcutRecorder(shortcut: $ocrManager.panelShortcut,
-                                 validate: { ocrManager.validateShortcut($0, role: .panel) })
-            }
-            Text("‘지금 캡처’는 간격을 무시하고 현재 화면을 즉시 한 번 캡처합니다. 메뉴바 아이콘이 가려지면 패널 단축키나 Dock으로 설정에 들어갑니다.")
-                .font(.caption2)
+    private var detailBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("세부 설정")
+                .font(.caption)
                 .foregroundStyle(.secondary)
 
-            if let warning = ocrManager.shortcutWarning {
-                HStack(alignment: .top, spacing: 5) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(warning)
-                        .foregroundStyle(.orange)
+            VStack(spacing: 0) {
+                SettingsFold(title: "캡션 모양",
+                              systemImage: "captions.bubble",
+                              help: "항상 표시, 위치, 글자 크기") {
+                    captionDetails
                 }
-                .font(.caption2)
-                .fixedSize(horizontal: false, vertical: true)
+                detailDivider
+                SettingsFold(title: "단축키",
+                              systemImage: "keyboard",
+                              help: "영역 선택, 지금 캡처, 패널 열기",
+                              showsAlert: ocrManager.shortcutWarning != nil) {
+                    shortcutDetails
+                }
+                detailDivider
+                SettingsFold(title: "앱 접근",
+                              systemImage: "dock.rectangle",
+                              help: "Dock과 메뉴바 아이콘",
+                              showsAlert: ocrManager.accessWarning != nil) {
+                    accessDetails
+                }
+                detailDivider
+                SettingsFold(title: "인식 품질",
+                              systemImage: "slider.horizontal.3",
+                              help: "전처리와 대비") {
+                    qualityDetails
+                }
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .background(Color(nsColor: .quaternarySystemFill),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+    }
 
-            Divider().padding(.vertical, 2)
+    private var detailDivider: some View {
+        Divider().padding(.leading, 22)
+    }
 
-            Toggle(isOn: $ocrManager.captionOverlayEnabled) {
-                Text("화면에 캡션 표시")
-                    .font(.subheadline)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-
-            Toggle(isOn: $ocrManager.captionPinned) {
-                Text("캡션 항상 띄워두기")
-                    .font(.subheadline)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .disabled(!ocrManager.captionOverlayEnabled)
-
+    private var captionDetails: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            optionToggle("항상 표시",
+                         help: "캡션을 직접 끄기 전까지 화면에 남겨 둡니다.",
+                         isOn: $ocrManager.captionPinned,
+                         enabled: ocrManager.captionOverlayEnabled)
             HStack {
-                Text("캡션 위치")
+                Text("위치")
                     .font(.subheadline)
                 Spacer()
-                Picker("", selection: $ocrManager.captionPosition) {
+                Picker("캡션 위치", selection: $ocrManager.captionPosition) {
                     ForEach(CaptionPosition.allCases) { pos in
                         Text(pos.title).tag(pos)
                     }
@@ -267,10 +289,10 @@ struct ContentView: View {
                 .pickerStyle(.menu)
                 .fixedSize()
                 .disabled(!ocrManager.captionOverlayEnabled)
+                .accessibilityLabel("캡션 위치")
             }
-
             HStack {
-                Text("캡션 글자 크기")
+                Text("글자 크기")
                     .font(.subheadline)
                 Spacer()
                 Text("\(Int(ocrManager.captionFontSize.rounded()))pt")
@@ -281,129 +303,176 @@ struct ContentView: View {
                    in: CaptionLayout.fontSizeRange,
                    step: 1)
                 .disabled(!ocrManager.captionOverlayEnabled)
-
-            Divider().padding(.vertical, 2)
-
-            Toggle(isOn: $ocrManager.accumulate) {
-                Text("누적 모드 (새 자막을 지우지 않고 이어붙임)")
-                    .font(.subheadline)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-
-            Toggle(isOn: $ocrManager.deduplicate) {
-                Text("중복 자막 제거 (완전히 같은 문구는 한 번만)")
-                    .font(.subheadline)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .disabled(!ocrManager.accumulate)
-
-            Toggle(isOn: $ocrManager.autoCopy) {
-                Text("새 텍스트 자동 복사")
-                    .font(.subheadline)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-
-            Divider().padding(.vertical, 2)
-
-            ocrQualitySection
         }
+        .padding(.top, 2)
+        .padding(.bottom, 8)
     }
 
-    // MARK: - 앱 접근 (노치·메뉴바 혼잡 대비)
-
-    private var accessSection: some View {
+    private var shortcutDetails: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("앱 접근")
-                .font(.subheadline.weight(.semibold))
-            Text("이 맥은 노치와 엣지 등 메뉴바 아이콘이 많으면 autoOCR을 누르지 못할 수 있습니다. Dock이나 패널 단축키(기본 ⌘⇧,)로 열고, 붐비면 메뉴바 아이콘을 끄세요.")
-                .font(.caption2)
+            shortcutRow("영역 선택", shortcut: $ocrManager.globalShortcut, role: .region)
+            shortcutRow("지금 캡처", shortcut: $ocrManager.captureShortcut, role: .captureNow)
+            shortcutRow("패널 열기", shortcut: $ocrManager.panelShortcut, role: .panel)
+            Text("‘지금 캡처’는 주기를 무시하고 한 번만 읽습니다. 주기를 끄면 이 단축키로만 캡처합니다. 메뉴바가 가리면 패널 단축키나 Dock으로 들어옵니다.")
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-
-            Toggle(isOn: $ocrManager.showDockIcon) {
-                Text("Dock에 아이콘 표시")
-                    .font(.subheadline)
+            if let warning = ocrManager.shortcutWarning {
+                warningLine(warning)
             }
-            .toggleStyle(.switch)
-            .controlSize(.small)
+        }
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+    }
 
-            Toggle(isOn: $ocrManager.showMenuBarIcon) {
-                Text("메뉴바에 아이콘 표시")
-                    .font(.subheadline)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-
-            if let warning = ocrManager.accessWarning {
-                HStack(alignment: .top, spacing: 5) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(warning)
-                        .foregroundStyle(.orange)
-                }
-                .font(.caption2)
+    private var accessDetails: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("노치나 다른 아이콘 때문에 메뉴바에서 누르기 어려우면 Dock이나 패널 단축키(기본 ⌘⇧,)로 여세요.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 16) {
+                optionToggle("Dock",
+                             help: "Dock에 autoOCR 아이콘을 둡니다.",
+                             isOn: $ocrManager.showDockIcon)
+                optionToggle("메뉴바",
+                             help: "메뉴바에 autoOCR 아이콘을 둡니다.",
+                             isOn: $ocrManager.showMenuBarIcon)
             }
+            if let warning = ocrManager.accessWarning {
+                warningLine(warning)
+            }
+        }
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+    }
 
-            Divider().padding(.vertical, 2)
+    private var qualityDetails: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 16) {
+                optionToggle("하이브리드",
+                             help: "여러 전처리를 비교해 더 정확한 쪽을 고릅니다. 느립니다.",
+                             isOn: $ocrManager.hybridMode)
+                optionToggle("언어 보정",
+                             help: "문맥으로 글자를 고칩니다. 고유명사나 코드에는 끄세요.",
+                             isOn: $ocrManager.languageCorrection)
+            }
+            HStack(spacing: 16) {
+                optionToggle("업스케일",
+                             help: "작은 글자를 키운 뒤 인식합니다.",
+                             isOn: $ocrManager.upscaleSmallText)
+                optionToggle("흑백",
+                             help: "반투명하거나 복잡한 배경을 고대비 흑백으로 바꿉니다.",
+                             isOn: $ocrManager.binarize)
+            }
+            HStack {
+                Text("대비")
+                    .font(.subheadline)
+                Spacer()
+                Text(String(format: "%.2f", ocrManager.ocrContrast))
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: $ocrManager.ocrContrast, in: 1.0...1.6, step: 0.02)
+                .help("1.00은 원본입니다. 높일수록 글자와 배경을 더 벌립니다.")
+        }
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+    }
+
+    private var presetButtons: some View {
+        ForEach(intervalPresets, id: \.self) { preset in
+            presetButton(preset)
         }
     }
 
-    // MARK: - OCR 품질 (전처리 파라미터)
-
-    private var ocrQualitySection: some View {
-        DisclosureGroup("OCR 품질 설정") {
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle(isOn: $ocrManager.hybridMode) {
-                    Text("고품질 하이브리드 (여러 전처리 비교, 느림)")
-                        .font(.subheadline)
+    private var languageControl: some View {
+        HStack(spacing: 6) {
+            Text("언어")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Picker("인식 언어", selection: $ocrManager.language) {
+                ForEach(RecognitionLanguage.allCases) { lang in
+                    Text(lang.title).tag(lang)
                 }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-
-                Toggle(isOn: $ocrManager.languageCorrection) {
-                    Text("언어 보정 (고유명사·코드엔 끄기)")
-                        .font(.subheadline)
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-
-                Toggle(isOn: $ocrManager.upscaleSmallText) {
-                    Text("작은 글자 업스케일")
-                        .font(.subheadline)
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-
-                Toggle(isOn: $ocrManager.binarize) {
-                    Text("고대비 흑백 (반투명·복잡한 배경에 유리)")
-                        .font(.subheadline)
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-
-                HStack {
-                    Text("대비")
-                        .font(.subheadline)
-                    Spacer()
-                    Text(String(format: "%.2f", ocrManager.ocrContrast))
-                        .font(.subheadline.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                Slider(value: $ocrManager.ocrContrast, in: 1.0...1.6, step: 0.02)
             }
-            .padding(.top, 4)
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .fixedSize()
+            .accessibilityLabel("인식 언어")
         }
-        .font(.subheadline)
+    }
+
+    @ViewBuilder
+    private func presetButton(_ preset: Double) -> some View {
+        let title = Self.format(preset)
+        if isSelected(preset) {
+            Button(title) { ocrManager.recognitionInterval = preset }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .help(presetHelp(preset))
+        } else {
+            Button(title) { ocrManager.recognitionInterval = preset }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help(presetHelp(preset))
+        }
+    }
+
+    private func presetHelp(_ preset: Double) -> String {
+        if preset <= 0 { return "자동 인식을 끄고, 지금 캡처 단축키로만 읽습니다." }
+        return "이 주기로 자동 인식합니다."
+    }
+
+    private func shortcutRow(_ title: String,
+                             shortcut: Binding<KeyboardShortcutConfig?>,
+                             role: OCRManager.ShortcutRole) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text(title)
+                .font(.subheadline)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            ShortcutRecorder(shortcut: shortcut,
+                             validate: { ocrManager.validateShortcut($0, role: role) })
+        }
+    }
+
+    private func optionToggle(_ title: String,
+                              help: String,
+                              isOn: Binding<Bool>,
+                              enabled: Bool = true) -> some View {
+        Toggle(isOn: isOn) {
+            Text(title)
+                .font(.subheadline)
+                .lineLimit(1)
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .help(help)
+        .disabled(!enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func warningLine(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 5) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(text)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.caption2)
     }
 
     /// 슬라이더는 로그 값을 다루고, 저장은 초 단위 실제 값으로 변환·스냅한다.
     private var logIntervalBinding: Binding<Double> {
         Binding(
-            get: { log(ocrManager.recognitionInterval) },
+            get: {
+                let seconds = RecognitionCopy.isAutomatic(ocrManager.recognitionInterval)
+                    ? ocrManager.recognitionInterval
+                    : OCRManager.intervalRange.lowerBound
+                return log(seconds)
+            },
             set: { ocrManager.recognitionInterval = Self.snap(exp($0)) }
         )
     }
@@ -424,7 +493,8 @@ struct ContentView: View {
     }
 
     private static func format(_ value: Double) -> String {
-        value < 1 ? String(format: "%.1f초", value) : "\(Int(value))초"
+        if value <= 0 { return "끔" }
+        return value < 1 ? String(format: "%.1f초", value) : "\(Int(value))초"
     }
 
     // MARK: - 하단 동작
@@ -463,7 +533,6 @@ struct ContentView: View {
             } label: {
                 Label("종료", systemImage: "power")
             }
-            .keyboardShortcut("q", modifiers: .command)
             .help("앱 종료 (⌘Q)")
         }
         .buttonStyle(.bordered)
@@ -472,10 +541,61 @@ struct ContentView: View {
     }
 }
 
+/// 세부 설정 한 묶음. DisclosureGroup 기본 여백은 이 360pt 패널에서 한 줄이 너무 높다.
+private struct SettingsFold<Content: View>: View {
+    let title: String
+    let systemImage: String
+    var help: String = ""
+    var showsAlert: Bool = false
+    @ViewBuilder var content: () -> Content
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: systemImage)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                    Text(title)
+                        .font(.subheadline)
+                    Spacer(minLength: 8)
+                    if showsAlert {
+                        Circle()
+                            .fill(.orange)
+                            .frame(width: 6, height: 6)
+                            .accessibilityLabel("확인이 필요합니다")
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(help)
+            .accessibilityValue(isExpanded ? "펼쳐짐" : "접힘")
+
+            if isExpanded {
+                content()
+                    .padding(.leading, 22)
+            }
+        }
+    }
+}
+
 /// 현재 상태를 색 점 + 라벨로 보여주는 배지.
 private struct StatusBadge: View {
     let isCapturing: Bool
     let isProcessing: Bool
+    let interval: Double
 
     private var color: Color {
         if !isCapturing { return .secondary }
@@ -484,7 +604,8 @@ private struct StatusBadge: View {
 
     private var label: String {
         if !isCapturing { return "대기" }
-        return isProcessing ? "인식 처리 중" : "실시간 인식 중"
+        if isProcessing { return "인식 처리 중" }
+        return RecognitionCopy.liveLabel(interval: interval)
     }
 
     var body: some View {

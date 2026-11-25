@@ -42,6 +42,14 @@ enum CaptionLayout {
     static let defaultFontSize: CGFloat = 18
     static let fontSizeRange: ClosedRange<Double> = 12...36
     static let defaultPosition: CaptionPosition = .topRight
+    /// 세 줄 자막이 말줄임으로 잘리지 않게 두고, 화면 전체를 덮지는 않는다.
+    static let maxLines = 6
+    static let minimumLinger: TimeInterval = 5
+
+    /// 다음 인식 전까지 직전 자막이 남는다. 짧은 주기도 최소 5초는 보여 준다.
+    static func linger(interval: TimeInterval) -> TimeInterval {
+        max(minimumLinger, interval)
+    }
 
     /// 코너에 둘 때는 폭을 좁혀 본문을 덜 가리고, 중앙은 조금 더 넓게.
     static func maxWidth(position: CaptionPosition, visibleWidth: CGFloat) -> CGFloat {

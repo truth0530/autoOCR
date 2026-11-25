@@ -37,6 +37,25 @@ enum RecognitionLanguage: String, CaseIterable, Identifiable {
     var isAutomatic: Bool { self == .auto }
 }
 
+/// 다시 실행해도 마지막 캡처 영역을 복구하기 위한 값.
+struct SavedRegion: Codable, Equatable {
+    var x, y, width, height: Double
+    var displayID: UInt32
+    var pixelScale: Double
+
+    init(rect: CGRect, displayID: CGDirectDisplayID, pixelScale: CGFloat) {
+        x = rect.origin.x
+        y = rect.origin.y
+        width = rect.width
+        height = rect.height
+        self.displayID = displayID
+        self.pixelScale = Double(pixelScale)
+    }
+
+    var rect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
+    var isUsable: Bool { width >= 1 && height >= 1 && pixelScale > 0 }
+}
+
 /// 화면 캡처와 OCR을 조율하는 상태 객체.
 @MainActor
 final class OCRManager: ObservableObject {
@@ -191,6 +210,8 @@ final class OCRManager: ObservableObject {
     private var recognitionTask: Task<Void, Never>?
     /// 사용자가 인식을 켜 둔 상태. 스트림이 죽어도 true면 재연결한다.
     private var shouldCapture = false
+    /// 영역 조절 오버레이가 떠 있는 동안 재연결·자동 시작을 막는다.
+    private var isSelectingRegion = false
     private var isRecovering = false
     private var recoverCount = 0
     private var lifecycleObservers: [NSObjectProtocol] = []
@@ -283,6 +304,7 @@ final class OCRManager: ObservableObject {
         if defaults.object(forKey: Keys.hybrid) != nil {
             hybridMode = defaults.bool(forKey: Keys.hybrid)
         }
+        restoreRegion(from: defaults)
         settingsLoaded = true
 
         AutoOCRRuntime.manager = self
@@ -294,7 +316,18 @@ final class OCRManager: ObservableObject {
     }
 
     func applyActivationPolicy() {
+        guard !AutoOCRRuntime.isQuitting else { return }
         NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
+    }
+
+    /// 종료가 시작되면 핫키·오버레이·캡처를 끊는다. 스트림이 다시 붙으면 프로세스가 남는다.
+    func shutdownForQuit() async {
+        isSelectingRegion = true
+        shouldCapture = false
+        selectionController.cancel()
+        hotKeyManager.unregisterAll()
+        captionMirror.hide()
+        await stopCapturing(silent: true)
     }
 
     /// 앱 기동 완료 후 한 번 더 등록한다. init 시점의 Carbon 타깃이 비어 핫키가 빠지는 경우를 막는다.
@@ -394,20 +427,41 @@ final class OCRManager: ObservableObject {
     // MARK: - 영역 선택 (선택 후 자동으로 인식 시작)
 
     func selectRegion() async {
-        ControlPanelController.shared.hide()
-        if isCapturing { await stopCapturing(silent: true) }
+        guard !AutoOCRRuntime.isQuitting, !isSelectingRegion else { return }
+        isSelectingRegion = true
+        defer { isSelectingRegion = false }
 
-        guard let result = await selectionController.selectRegion() else {
-            statusMessage = "영역 선택이 취소되었습니다."
+        let resume = shouldCapture || isCapturing
+        ControlPanelController.shared.hide()
+        // 스트림을 먼저 끊어야 오버레이가 뜨고, 새 영역이 기존 세션에 묻히지 않는다.
+        await stopCapturing(silent: true)
+        guard !AutoOCRRuntime.isQuitting else { return }
+
+        guard let result = await selectionController.selectRegion(existing: currentSelection()) else {
+            guard !AutoOCRRuntime.isQuitting else { return }
+            if resume {
+                await startCapturing(userInitiated: true)
+            } else {
+                statusMessage = "영역 선택이 취소되었습니다."
+            }
             return
         }
+        guard !AutoOCRRuntime.isQuitting else { return }
         selectedRegion = result.rect
         selectedDisplayID = result.displayID
         selectionSize = result.rect.size
         pixelScale = result.pixelScale
         hasSelection = true
+        saveRegion()
 
-        await startCapturing()
+        await startCapturing(userInitiated: true)
+    }
+
+    private func currentSelection() -> RegionSelectionResult? {
+        guard let selectedRegion, let selectedDisplayID else { return nil }
+        return RegionSelectionResult(rect: selectedRegion,
+                                    displayID: selectedDisplayID,
+                                    pixelScale: pixelScale)
     }
 
     // MARK: - 캡처 제어
@@ -420,8 +474,14 @@ final class OCRManager: ObservableObject {
         }
     }
 
-    func startCapturing() async {
-        guard !isCapturing else { return }
+    func startCapturing(userInitiated: Bool = false) async {
+        guard !AutoOCRRuntime.isQuitting else { return }
+        if isSelectingRegion && !userInitiated { return }
+        if isCapturing {
+            if !userInitiated { return }
+            await stopCapturing(silent: true)
+            guard !AutoOCRRuntime.isQuitting else { return }
+        }
         guard let region = selectedRegion else {
             statusMessage = "먼저 영역을 선택해주세요."
             return
@@ -431,9 +491,10 @@ final class OCRManager: ObservableObject {
 
         // 실제 권한 판정: ScreenCaptureKit 콘텐츠 조회가 성공하면 권한이 있는 것이다.
         // (CGPreflightScreenCaptureAccess는 부여 직후/개발 서명에서 신뢰하기 어렵다.)
+        // 권한 시트가 이 호출에 매달려 있으므로, 시간 제한은 사용자가 누를 수 있을 만큼 둔다.
         let content: SCShareableContent
         do {
-            content = try await Timed.run(seconds: 8) {
+            content = try await Timed.run(seconds: 90) {
                 try await Task.detached {
                     try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 }.value
@@ -441,23 +502,39 @@ final class OCRManager: ObservableObject {
         } catch is Timed.Failure {
             statusMessage = "화면 캡처 응답이 없습니다. 화면 기록 권한을 확인한 뒤 다시 시도해주세요."
             isCapturing = false
+            shouldCapture = false
             return
         } catch {
+            shouldCapture = false
+            guard !AutoOCRRuntime.isQuitting else { return }
             await guidePermission()
+            return
+        }
+        guard !AutoOCRRuntime.isQuitting else {
+            shouldCapture = false
             return
         }
 
         guard let display = display(for: selectedDisplayID, in: content) else {
             statusMessage = "캡처할 디스플레이를 찾을 수 없습니다."
+            shouldCapture = false
             return
         }
 
+        let ownApp = content.applications.first { app in
+            app.bundleIdentifier == Bundle.main.bundleIdentifier
+        }
         do {
             let frames = try await captureService.start(region: region,
                                                         display: display,
-                                                        pixelScale: pixelScale)
+                                                        pixelScale: pixelScale,
+                                                        excluding: ownApp.map { [$0] } ?? [])
+            guard !AutoOCRRuntime.isQuitting else {
+                await stopCapturing(silent: true)
+                return
+            }
             isCapturing = true
-            statusMessage = "실시간 인식 중…"
+            statusMessage = capturingStatus()
             recognitionTask = Task { await consume(frames) }
         } catch is Timed.Failure {
             statusMessage = "캡처 시작이 시간 초과되었습니다. 다시 시작해주세요."
@@ -481,10 +558,25 @@ final class OCRManager: ObservableObject {
         if !silent { statusMessage = "인식을 중지했습니다." }
     }
 
+    /// 자동 인식이 켜져 있으면 주기 문구, 꺼져 있으면 수동 캡처 안내.
+    private func capturingStatus() -> String {
+        if RecognitionCopy.isAutomatic(recognitionInterval) {
+            return RecognitionCopy.liveLabel(interval: recognitionInterval) + "…"
+        }
+        return "자동 인식 끔 · \(captureKeyLabel)로 캡처"
+    }
+
+    private var captureKeyLabel: String {
+        captureShortcut?.displayString ?? "지금 캡처"
+    }
+
     /// 간격을 무시하고 지금 이 순간의 화면을 즉시 한 번 인식한다. (전역 단축키용)
     func captureNow() async {
+        guard !AutoOCRRuntime.isQuitting else { return }
         guard isCapturing, let pixelBuffer = latestBuffer else {
-            statusMessage = "먼저 인식을 시작해주세요."
+            statusMessage = RecognitionCopy.isAutomatic(recognitionInterval)
+                ? "먼저 인식을 시작해주세요."
+                : "먼저 시작을 눌러 주세요. 그다음 \(captureKeyLabel)로 캡처합니다."
             return
         }
         isProcessing = true
@@ -522,6 +614,9 @@ final class OCRManager: ObservableObject {
 
             recoverCount = 0
             latestBuffer = pixelBuffer   // '지금 캡처'용 최신 프레임 보관
+
+            // 주기를 끄면 프레임만 갱신한다. 0초로 두면 매 프레임을 인식하게 된다.
+            guard RecognitionCopy.isAutomatic(recognitionInterval) else { continue }
 
             let now = Date()
             guard now.timeIntervalSince(lastRun) >= recognitionInterval else { continue }
@@ -562,15 +657,40 @@ final class OCRManager: ObservableObject {
             isProcessing = false
         }
         isProcessing = false
+        // 메뉴막대 ‘공유 중단’은 스트림 에러로 온다. 여기서 다시 붙이면 버튼이 아무 일도 안 한 것처럼 보인다.
+        if let kind = captureService.takeExternalStop(), !kind.restartsAutomatically {
+            shouldCapture = false
+            isCapturing = false
+            recognitionTask = nil
+            guard !Task.isCancelled, !isSelectingRegion, !AutoOCRRuntime.isQuitting else { return }
+            if kind == .userStopped {
+                statusMessage = "공유를 중단했습니다. 영역을 다시 고르세요."
+                Task { @MainActor in await self.handleUserStoppedSharing() }
+            } else {
+                statusMessage = "화면 공유가 중단되었습니다. 영역 선택으로 다시 시작할 수 있습니다."
+                Task { @MainActor in self.showPanel() }
+            }
+            return
+        }
         // 사용자가 끈 게 아닌데 스트림이 끝나면(절전·화면 변경·권한 흔들림) 재연결한다.
-        if !Task.isCancelled, shouldCapture {
+        // 종료·영역 조절 중이면 다시 붙이지 않는다. 붙이면 프로세스가 남거나 새 영역이 버려진다.
+        if !Task.isCancelled, shouldCapture, !isSelectingRegion, !AutoOCRRuntime.isQuitting {
             await recoverCapture(reason: "스트림 종료")
+        }
+    }
+
+    /// ‘공유 중단’ 뒤에는 시스템 메뉴에 영역 조절이 없다. 선택 화면을 바로 연다.
+    private func handleUserStoppedSharing() async {
+        guard !AutoOCRRuntime.isQuitting, !isSelectingRegion else { return }
+        await selectRegion()
+        if !isCapturing, !AutoOCRRuntime.isQuitting {
+            showPanel()
         }
     }
 
     /// 죽은 캡처 세션을 몇 번까지 자동으로 다시 연다. 프레임이 다시 오면 recoverCount가 0으로 돌아간다.
     private func recoverCapture(reason: String) async {
-        guard shouldCapture, !isRecovering else { return }
+        guard shouldCapture, !isRecovering, !isSelectingRegion, !AutoOCRRuntime.isQuitting else { return }
         if recoverCount >= 5 {
             shouldCapture = false
             isCapturing = false
@@ -580,7 +700,7 @@ final class OCRManager: ObservableObject {
         isRecovering = true
         defer { isRecovering = false }
 
-        while shouldCapture && recoverCount < 5 {
+        while shouldCapture && !isSelectingRegion && !AutoOCRRuntime.isQuitting && recoverCount < 5 {
             recoverCount += 1
             statusMessage = "캡처 재연결 중… (\(reason))"
             recognitionTask?.cancel()
@@ -591,7 +711,7 @@ final class OCRManager: ObservableObject {
             isProcessing = false
             let delay = min(0.4 * Double(recoverCount), 2.0)
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            guard shouldCapture else { return }
+            guard shouldCapture, !isSelectingRegion, !AutoOCRRuntime.isQuitting else { return }
             await startCapturing()
             if isCapturing { return }
         }
@@ -645,13 +765,15 @@ final class OCRManager: ObservableObject {
 
         // 캡션 미러에 방금 캡처한 텍스트를 표시한다.
         if captionOverlayEnabled {
-            captionMirror.update(trimmed, pinned: captionPinned)
+            captionMirror.update(trimmed, pinned: captionPinned, linger: recognitionInterval)
         }
 
         // 자동 복사는 방금 인식된 블록만 복사해 클립보드 부담을 줄인다.
         if autoCopy {
             writeToPasteboard(trimmed)
-            statusMessage = "자동 복사됨 · 실시간 인식 중…"
+            statusMessage = RecognitionCopy.isAutomatic(recognitionInterval)
+                ? "자동 복사됨 · " + RecognitionCopy.liveLabel(interval: recognitionInterval) + "…"
+                : "복사됨 · \(captureKeyLabel)로 다시 캡처"
             toast.show("복사됨")
         }
     }
@@ -751,6 +873,27 @@ final class OCRManager: ObservableObject {
         static let upscale = "ocrUpscale"
         static let binarize = "ocrBinarize"
         static let hybrid = "ocrHybrid"
+        static let region = "selectedRegion"
+    }
+
+    private func saveRegion() {
+        guard let selectedRegion, let selectedDisplayID else { return }
+        let saved = SavedRegion(rect: selectedRegion,
+                                displayID: selectedDisplayID,
+                                pixelScale: pixelScale)
+        guard let data = try? JSONEncoder().encode(saved) else { return }
+        UserDefaults.standard.set(data, forKey: Keys.region)
+    }
+
+    private func restoreRegion(from defaults: UserDefaults) {
+        guard let data = defaults.data(forKey: Keys.region),
+              let saved = try? JSONDecoder().decode(SavedRegion.self, from: data),
+              saved.isUsable else { return }
+        selectedRegion = saved.rect
+        selectedDisplayID = saved.displayID
+        pixelScale = CGFloat(saved.pixelScale)
+        selectionSize = saved.rect.size
+        hasSelection = true
     }
 
     private func persist() {

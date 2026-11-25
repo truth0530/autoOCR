@@ -13,8 +13,6 @@ final class CaptionMirror {
     /// fade-out 완료 콜백이 이후 present를 덮어쓰지 못하게 세대 번호를 둔다.
     private var generation = 0
 
-    private let autoHideDelay: TimeInterval = 5
-
     struct CaptionAppearance {
         var position: CaptionPosition = .topRight
         var fontSize: CGFloat = CaptionLayout.defaultFontSize
@@ -29,7 +27,7 @@ final class CaptionMirror {
     }
 
     /// 새 캡처 텍스트를 표시한다.
-    func update(_ text: String, pinned: Bool) {
+    func update(_ text: String, pinned: Bool, linger: TimeInterval) {
         self.pinned = pinned
         lastText = text
         present(text)
@@ -37,7 +35,7 @@ final class CaptionMirror {
             hideWorkItem?.cancel()
             hideWorkItem = nil
         } else {
-            scheduleHide(after: autoHideDelay)
+            scheduleHide(after: CaptionLayout.linger(interval: linger))
         }
     }
 
@@ -49,7 +47,7 @@ final class CaptionMirror {
             hideWorkItem?.cancel()
             hideWorkItem = nil
         } else {
-            scheduleHide(after: 1.0)
+            scheduleHide(after: CaptionLayout.minimumLinger)
         }
     }
 
@@ -136,7 +134,7 @@ final class CaptionMirror {
         panel.becomesKeyOnlyIfNeeded = true
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.collectionBehavior = WindowChrome.caption
         panel.contentView = NSHostingView(rootView: CaptionView(text: "",
                                                                 maxWidth: 560,
                                                                 fontSize: CaptionLayout.defaultFontSize,
@@ -169,7 +167,7 @@ private struct CaptionView: View {
             .font(.system(size: fontSize, weight: .semibold))
             .foregroundStyle(.white)
             .multilineTextAlignment(alignment)
-            .lineLimit(3)
+            .lineLimit(CaptionLayout.maxLines)
             .truncationMode(.tail)
             .shadow(color: .black.opacity(0.6), radius: 2, y: 1)
             .padding(.horizontal, 22)

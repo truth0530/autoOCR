@@ -3,13 +3,41 @@ import AppKit
 
 enum AutoOCRRuntime {
     static weak var manager: OCRManager?
+    /// 종료가 시작되면 캡처 재연결과 영역 선택 재시작을 막는다. 메인 스레드에서만 바꾼다.
+    static var isQuitting = false
 }
 
 final class AutoOCRAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installQuitMenuIfNeeded()
         Task { @MainActor in
             AutoOCRRuntime.manager?.finishLaunching()
+            installQuitMenuIfNeeded()
         }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        installQuitMenuIfNeeded()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // 테스트 호스트는 XCTest가 프로세스를 닫는다. 강제 exit와 겹치면 러너가 멈춘다.
+        if Self.isRunningTests { return .terminateNow }
+        if AutoOCRRuntime.isQuitting {
+            return .terminateNow
+        }
+        AutoOCRRuntime.isQuitting = true
+        let manager = AutoOCRRuntime.manager
+        Task { @MainActor in
+            await manager?.shutdownForQuit()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        // ScreenCaptureKit이 stop을 끝까지 잡지 않아도 프로세스가 도크에 남지 않게 한다.
+        Task.detached {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            exit(0)
+        }
+        return .terminateLater
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -62,6 +90,38 @@ final class AutoOCRAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    private static var isRunningTests: Bool {
+        let env = ProcessInfo.processInfo.environment
+        if env["XCTestConfigurationFilePath"] != nil { return true }
+        return NSClassFromString("XCTestCase") != nil
+    }
+
+    /// SwiftUI MenuBarExtra만 있으면 앱 메뉴가 없어 ⌘Q가 전달되지 않는다.
+    func installQuitMenuIfNeeded() {
+        let main = NSApp.mainMenu ?? NSMenu()
+        if NSApp.mainMenu == nil {
+            NSApp.mainMenu = main
+        }
+        let appItem: NSMenuItem
+        if let first = main.items.first, first.submenu != nil {
+            appItem = first
+        } else {
+            appItem = NSMenuItem()
+            appItem.submenu = NSMenu(title: "autoOCR")
+            main.insertItem(appItem, at: 0)
+        }
+        guard let appMenu = appItem.submenu else { return }
+        let hasQuit = appMenu.items.contains { item in
+            item.action == #selector(NSApplication.terminate(_:)) && item.keyEquivalent == "q"
+        }
+        if hasQuit { return }
+        let quit = NSMenuItem(title: "autoOCR 종료",
+                              action: #selector(NSApplication.terminate(_:)),
+                              keyEquivalent: "q")
+        quit.keyEquivalentModifierMask = .command
+        appMenu.addItem(quit)
     }
 }
 

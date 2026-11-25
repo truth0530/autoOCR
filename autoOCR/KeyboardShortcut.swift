@@ -95,6 +95,14 @@ final class GlobalHotKeyManager {
         return true
     }
 
+    /// 종료 시 핫키가 새 캡처를 다시 열지 않도록 전부 해제한다.
+    func unregisterAll() {
+        for entry in entries.values {
+            if let ref = entry.ref { UnregisterEventHotKey(ref) }
+        }
+        entries.removeAll()
+    }
+
     fileprivate func handle(id: UInt32) {
         entries[id]?.action()
     }

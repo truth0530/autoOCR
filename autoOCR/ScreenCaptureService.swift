@@ -7,16 +7,65 @@ import Darwin
 enum Timed {
     enum Failure: Error { case timeout }
 
+    /// 한 번만 continuation을 재개한다. 제한 시간과 작업 완료가 겹쳐도 이중 재개하지 않는다.
+    private final class ResumeGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resumed = false
+
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if resumed { return false }
+            resumed = true
+            return true
+        }
+    }
+
+    /// 제한 시간이 지나면 작업이 남아 있어도 반환한다.
+    ///
+    /// `withThrowingTaskGroup`은 `cancelAll()` 뒤에도 자식이 끝날 때까지 기다리므로,
+    /// `SCStream.stopCapture()`처럼 취소를 무시하는 호출에 쓰면 종료와 영역 변경이 멈춘다.
     static func run<T>(seconds: TimeInterval, _ operation: @escaping () async throws -> T) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                throw Failure.timeout
+        let nanos = UInt64(max(0, seconds) * 1_000_000_000)
+        return try await withCheckedThrowingContinuation { continuation in
+            let gate = ResumeGate()
+            let task = Task {
+                do {
+                    let value = try await operation()
+                    if gate.claim() { continuation.resume(returning: value) }
+                } catch {
+                    if gate.claim() { continuation.resume(throwing: error) }
+                }
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+            Task.detached {
+                try? await Task.sleep(nanoseconds: nanos)
+                if gate.claim() {
+                    task.cancel()
+                    continuation.resume(throwing: Failure.timeout)
+                }
+            }
+        }
+    }
+}
+
+/// 스트림이 밖에서 끊긴 이유. 메뉴막대 ‘공유 중단’은 `.userStopped`다.
+enum CaptureStopKind: Equatable {
+    case userStopped
+    case systemStopped
+    /// 절전·화면 변경처럼 앱이 다시 붙여도 되는 끊김.
+    case interrupted
+
+    var restartsAutomatically: Bool { self == .interrupted }
+
+    static func classify(domain: String, code: Int) -> CaptureStopKind {
+        guard domain == SCStreamErrorDomain else { return .interrupted }
+        switch SCStreamError.Code(rawValue: code) {
+        case .userStopped:
+            return .userStopped
+        case .systemStoppedStream:
+            return .systemStopped
+        default:
+            return .interrupted
         }
     }
 }
@@ -32,6 +81,9 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
     // continuation은 샘플 큐(yield)와 메인 액터(start/stop) 양쪽에서 접근하므로 락으로 보호한다.
     private let lock = NSLock()
     private var _continuation: AsyncStream<CVPixelBuffer>.Continuation?
+    /// 앱이 `stopCapture`를 호출한 스트림. 이 종료는 사용자의 ‘공유 중단’이 아니다.
+    private var ignoredStopIDs: Set<ObjectIdentifier> = []
+    private var externalStop: CaptureStopKind?
 
     private func setContinuation(_ value: AsyncStream<CVPixelBuffer>.Continuation?) {
         lock.lock(); defer { lock.unlock() }
@@ -46,12 +98,18 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     /// 지정한 영역(top-left screen points)을 캡처하기 시작한다.
+    /// - Parameter excluding: 캡처에서 뺄 앱. 영역 조절 오버레이와 캡션 미러가 다시 인식되지 않게 자기 자신을 넘긴다.
     /// - Returns: 완성된 프레임마다 픽셀 버퍼를 방출하는 async 스트림.
-    func start(region: CGRect, display: SCDisplay, pixelScale: CGFloat) async throws -> AsyncStream<CVPixelBuffer> {
+    func start(region: CGRect,
+               display: SCDisplay,
+               pixelScale: CGFloat,
+               excluding: [SCRunningApplication] = []) async throws -> AsyncStream<CVPixelBuffer> {
         // 이전 스트림이 남아 있으면 먼저 정리한다. (재시작 시 이중 캡처·멈춤 방지)
         await stop()
 
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        let filter = SCContentFilter(display: display,
+                                     excludingApplications: excluding,
+                                     exceptingWindows: [])
 
         let config = SCStreamConfiguration()
         config.sourceRect = region                                   // screen points 단위
@@ -64,6 +122,10 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
+        lock.lock()
+        externalStop = nil
+        self.stream = stream
+        lock.unlock()
 
         // 캡처 시작 전에 continuation을 설정해 초기 프레임 유실을 막는다.
         let frames = AsyncStream<CVPixelBuffer>(bufferingPolicy: .bufferingNewest(1)) { continuation in
@@ -72,27 +134,56 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
 
         do {
             try await Timed.run(seconds: 8) {
-                try await Task.detached {
-                    try await stream.startCapture()
-                }.value
+                try await Self.startCapture(stream)
             }
         } catch {
-            setContinuation(nil)
-            try? await Timed.run(seconds: 3) { try await stream.stopCapture() }
+            await stop()
             throw error
         }
-        self.stream = stream
         return frames
     }
 
     func stop() async {
+        let stopping: SCStream? = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let stream else { return nil }
+            ignoredStopIDs.insert(ObjectIdentifier(stream))
+            self.stream = nil
+            return stream
+        }()
         withContinuation { $0.finish() }
         setContinuation(nil)
-        if let stream {
-            self.stream = nil
-            try? await Timed.run(seconds: 3) {
+        if let stopping {
+            await Self.stopCapture(stopping)
+            lock.lock()
+            ignoredStopIDs.remove(ObjectIdentifier(stopping))
+            lock.unlock()
+        }
+    }
+
+    /// 사용자가 메뉴막대에서 끊었는지 한 번만 꺼낸다.
+    func takeExternalStop() -> CaptureStopKind? {
+        lock.lock()
+        defer { lock.unlock() }
+        let kind = externalStop
+        externalStop = nil
+        return kind
+    }
+
+    /// 메인 스레드에서 `stopCapture`를 직접 기다리면 샘플 큐와 서로 대기하며 멈춘다.
+    /// 멈추지 않는 호출은 제한 시간 뒤에 버리고, 스트림 참조는 이미 비워 둔다.
+    private static func startCapture(_ stream: SCStream) async throws {
+        try await Task.detached {
+            try await stream.startCapture()
+        }.value
+    }
+
+    private static func stopCapture(_ stream: SCStream) async {
+        try? await Timed.run(seconds: 0.8) {
+            try await Task.detached {
                 try await stream.stopCapture()
-            }
+            }.value
         }
     }
 
@@ -111,6 +202,20 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // 에러 객체는 XPC로 넘어온다. 코드를 바로 값으로 복사해 두고 객체를 붙잡지 않는다.
+        let ns = error as NSError
+        let kind = CaptureStopKind.classify(domain: ns.domain, code: ns.code)
+        let id = ObjectIdentifier(stream)
+        lock.lock()
+        let ignored = ignoredStopIDs.contains(id)
+        if ignored { ignoredStopIDs.remove(id) }
+        let isCurrent = self.stream === stream
+        if !ignored && isCurrent {
+            externalStop = kind
+            self.stream = nil
+        }
+        lock.unlock()
+        guard !ignored, isCurrent else { return }
         withContinuation { $0.finish() }
         setContinuation(nil)
     }
